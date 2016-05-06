@@ -1,0 +1,24 @@
+From this directory only, to run the project use:
+
+	scrapy crawl hotelspider -a constraints=[cities, hotels, reviews] -a out=desiredoutputfile.xml -a timeout=[base, variance] -a review_timeout=[number of reviews to process before timing out]
+
+For the constraints:
+ Cities, hotels, and reviews are integers representing the amount you 
+want scraped of each. If the number is too large it will scrape as much
+as possible. If you want to scrape everything available, just use 0. This is a required parameter.
+
+For the out:
+ This is the name of the desired output file. It is specificed from the current directory. You do not have to specify this parameter. If it is not set, the spider will output to standard out. 
+
+For the timeout:
+ This is the timeout base and variance quantity. When the program times out it will use these quantities, or 20,5 respectively by default.
+
+For the review_timeout:
+ This is the number of reviews we will process before timing out. (i.e, time out every 15 reviews)
+
+Example:
+	scrapy crawl hotelspider -a constraints=[2,2,500] -a out=hotels.xml -a timeout=[10,3] -a review_timeout=25
+
+This will scrape 2 cities, getting 2 hotels per city, and 500 reviews per hotel. This will save the output  in hotels.xml. When timing out, it will use a quantity between 7 and 13 seconds. It will timeout every 25 reviews. Negative values are not handled. 
+
+The settings file is down one directory, and it's pretty self explanatory. Don't change the top three options. (BOT_NAME, etc.) The download delay is set to five seconds by default which might be too slow for you.

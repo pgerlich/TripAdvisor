@@ -1,0 +1,534 @@
+# -*- coding: utf-8 -*-
+import scrapy
+from scrapy.spider import Spider
+from scrapy.http import Request
+from scrapy.selector import Selector
+import lxml.etree as xml
+#import xml.etree.ElementTree as xml
+import sys
+import time
+import random
+
+#scrapes hotels on tripadvisor.com for hotel, review, and reviewer data using the Scrapy module and then writes the result as XML
+class HotelspiderSpider(scrapy.Spider):
+    name = "hotelspider"            
+        
+    root = xml.Element("Hotels")
+
+    #command line argument for the minimum number of cities to be scraped, if 0 is given, the spider crawls as many as possible
+    cities = 0
+    #command line argument for the minimum number of hotels per city be scraped, if 0 is given, the spider crawls as many as possible
+    hotels = 0
+    #command line argument for the minimum number of reviews per hotel be scraped, if 0 is given, the spider crawls as many as possible
+    reviews = 0
+
+    #This is the (command line argument) location for the final XML output
+    writeLocation = sys.stdout
+
+    #Base of timeout and variance - timeout will be timeOutBase +/- timeOutVariance
+    timeOutBase = 20
+
+    timeOutVariance = 5
+
+    #We are globally tracking reviews, since they are relatively asynchronous. We timeout every 100 reviews
+    reviews_since_timeout = 0
+   
+    review_threshold = 30
+ 
+    #verbose printing
+    verbose = False
+
+    #stores all of the links to the cities from the main page
+    city_links = []
+    
+    #the maximum number of reviews to be scraped
+    max_reviews = 0
+
+    #the running total of reviews scraped
+    total_reviews_scraped = 0
+
+    #parses and stores the command line arguments
+    def __init__ (self, domain=None, constraints=[], out="", timeout=[], review_timeout=""):
+        #Handle city, hotel, review size constraints
+	self.cities = int(constraints[1:constraints.find(",")])
+        constraints = constraints[constraints.find(",")+1:]
+        self.hotels = int(constraints[:constraints.find(",")])
+        constraints = constraints[constraints.find(",")+1:]
+        self.reviews = int(constraints[:constraints.find(",")])
+
+	#Handle timeout constraints
+	self.timeOutBase = int(timeout[1:timeout.find(",")])
+	timeout = timeout[timeout.find(",")+1:]
+	self.timeOutVariance = int(timeout[:timeout.find("]")])
+	
+	#Handle output location (default = standard out)
+	if ( len(out) > 1 ):
+	   self.writeLocation = out
+
+	if ( len(review_timeout) > 0):
+	   self.review_threshold = int(review_timeout)
+	     
+	if constraints[constraints.find(",")+1:constraints.find("]")].lower() == "v":
+	    self.verbose = True
+
+    #starts at the main hotel page and goes to parser
+    def start_requests(self):
+        return [Request("http://tripadvisor.com/Hotels", callback=self.parse_main_page)]
+
+    #gets appropriate city links and yields them to parse_city
+    def parse_main_page(self, response):
+        print "\n----------MAIN-PAGE----------\n"
+        sel = Selector(response)
+        
+        #gets all the city links from the main page
+        self.city_links = sel.xpath("//div[@class='interior xxa']/ul/li/a/@href").extract()
+               
+        #removes junk links
+        i = 0
+        while i < len(self.city_links):
+            if (not("Hotels" in self.city_links[i])):
+                del self.city_links[i]
+                i-=1
+            i+=1
+            
+        #if cities is less than the number of scrapeable cities, the spider will only scrape that many cities
+        if(not(self.cities == 0 or self.cities >= len(self.city_links))):
+            self.city_links = self.city_links[:self.cities]
+            
+        #crawls and parses each city
+        for i in range(0, len(self.city_links)):
+
+            url = self.parse_url(self.city_links[i])
+	    request = Request(url, callback=self.parse_city)
+	    request.meta['city_num'] = i + 1
+           # print "Going to city page", i+1,  " out of ", len(self.city_links), "."
+            yield request
+            
+    #finds the requested number of hotel links        
+    def parse_city(self, response):
+        print "\n----------CITY-PAGE----------\nCity",response.meta['city_num'],"out of",len(self.city_links),"cities"
+        sel = Selector(response)
+       
+	self.timeout()
+ 
+        #gets the name of the city and creates the xml node
+        city_name = sel.xpath("//span[@itemprop='title']/text()").extract()[2]
+        city = xml.SubElement(self.root, "City")
+        city.set("name", city_name)
+        self.write_to_xml()
+        
+        #each city page has 30 hotels so this finds the minimum number of pages to be scraped
+        if(self.hotels != 0):
+            min_pages = (self.hotels - 1) / 30 + 1
+        else:
+            min_pages = sys.maxint
+        page = 1
+        hotel_links = []
+
+        request = Request(response.url, callback=self.parse_city_pages, dont_filter = True)
+        request.meta['page'] = page
+        request.meta['min_pages'] = min_pages
+        request.meta['hotel_links'] = hotel_links
+        request.meta['city'] = city
+	request.meta['city_num'] = response.meta['city_num']
+        yield request
+            
+    #recursively scrapes the city pages for hotel links
+    def parse_city_pages(self, response):
+        page = response.meta['page']
+        min_pages = response.meta['min_pages']
+        hotel_links = response.meta['hotel_links']
+        city = response.meta['city']
+	#city_num = response.meta['city_num'] - Is causing problems but I don't see that it needs to be used / is being used anywhere
+        sel = Selector(response)
+        page_hotel_links = sel.xpath("//span[@class='more']/a/@href").extract()
+        #last page to be scraped
+        if(page == min_pages):
+            try:
+                if(self.hotels % 30 != 0):
+                    page_hotel_links = page_hotel_links[:self.hotels % 30]
+            except IndexError:
+                print
+            for link in page_hotel_links:
+                hotel_links.append(link)
+            #scrapes through every hotel
+            for link in hotel_links:
+
+                url = self.parse_url(link)
+                request = Request(url, callback=self.parse_hotel_first_page)
+                request.meta['city'] = city
+	        yield request
+        #every other page
+        else:
+            for link in page_hotel_links:
+                hotel_links.append(link)
+            try:
+                #clicks the 'next' button
+                next_page = sel.xpath('//a[@class="nav next rndBtn rndBtnGreen taLnk"]/@href').extract()[0]
+
+                url = self.parse_url(next_page)
+                request = Request(url, callback=self.parse_city_pages)
+                request.meta['page'] = page + 1
+                request.meta['min_pages'] = min_pages
+                request.meta['hotel_links'] = hotel_links
+                request.meta['city'] = city
+                yield request
+            except IndexError:
+                #scrapes through every hotel
+                for link in hotel_links:
+
+                    url = self.parse_url(link)
+                    request = Request(url, callback=self.parse_hotel_first_page)
+                    request.meta['city'] = city
+                    yield request
+    
+    #parse hotel information that appears on every page just this once
+    def parse_hotel_first_page(self, response):
+        print "\n----------HOTEL-PAGE----------\n"
+        city = response.meta['city']
+        sel = Selector(response)
+        
+	self.timeout()
+
+        #creates hotel xml node
+        hotel = xml.SubElement(city, "Hotel")
+        hotel_name = sel.xpath('//div[@class="warLocName"]/text()').extract()[0]
+        hotel.set("name", hotel_name)
+        
+        #xml node for persistent data
+        info = xml.SubElement(hotel, "Hotel_Information")
+        
+        #methods that grab data on the first page only
+        self.first_page_ratings(info, sel)
+        self.first_page_traveler_type(info, sel)
+        self.first_page_rating_summary(info, sel)
+	self.first_page_address(info, sel)
+        
+        #node for continuously scraped information
+        user_reviews = xml.SubElement(hotel, "User_Reviews")
+        self.write_to_xml()
+        
+        #holds the total reviews scraped
+        total = 0
+
+        request = Request(response.url, callback=self.parse_all_pages, dont_filter=True)
+        request.meta['total'] = total
+        request.meta['user_reviews'] = user_reviews
+        yield request
+    
+    #recursively scrape reviews until enough reviews have been scraped    
+    def parse_all_pages(self, response):
+        print "\n----------SCRAPING-REVIEWS----------\n"
+        sel = Selector(response)
+        total = response.meta['total']
+
+        user_reviews = response.meta['user_reviews']
+ 
+        #get the headers to see which information can be scraped(is this reviewer a top contributor etc.)
+        try:
+            first_review_html = sel.xpath("//div[@class='reviewSelector   track_back']").extract()[0]
+	    html_list = [first_review_html]
+	except IndexError:
+	    html_list = []
+            
+        review_htmls = sel.xpath("//div[@class='reviewSelector  ']").extract()
+
+        for i in range(0, len(review_htmls)):
+           html_list.append(review_htmls[i])
+           
+        #increments total and stops when the review count is reached
+        total += len(html_list)
+	offSet = len(html_list)
+
+	self.reviews_since_timeout += offSet
+
+	#If we're about to go over our desired review ammount, remove the extra reviews
+	if(total > self.reviews and self.reviews != 0):
+	    offSet = len(html_list) - (total - self.reviews)
+	         
+        reviews = sel.xpath("//p[@class='partial_entry']").extract()
+
+        review_elements = []
+	count = 0
+
+	#Grab reviews (that are not replies to reviews) and add them to our list
+        for i in range(0, len(reviews)):
+
+	    #Ignore replies, ignore if we have reached our review quota
+	    if ( not('<span id="response' in reviews[i] ) and count < offSet):
+		
+		review = xml.SubElement(user_reviews, "Review")
+
+		#remove all paragraphing from reviews and saved to XML subelement
+		review_elements.append(self.addBody(review, reviews[i]))
+		count = count + 1
+        
+        #pairs reviewer with the correct information        
+        for i in range(0, offSet):
+            try:
+	        user = xml.SubElement(review_elements[i], "User")
+                #these functions add reviewer data to the correct use         
+                if "noQuotes" in html_list[i]:
+                   self.addTitle(sel, html_list[i], user)
+	        if '"location"' in html_list[i]:
+                   self.addLocation(sel, html_list[i], user)
+	        if "username mo" in html_list[i]:
+                    self.addUsername(sel, html_list[i], user)
+	        self.addReviewCount(sel, i, user)
+		self.addReviewRating(sel, i, user)
+	    except IndexError:
+	        if(i == offSet - 1):
+                    break
+                else:
+                    i+=1
+	
+	#We have all the reviews we want. Let's close out!
+	if (total > self.reviews and self.reviews != 0 ):
+	   self.write_to_xml()
+	   return;       
+
+	#Every x reviews we timeout - This is a global because reviews run psuedo-asynchronously
+	if (self.reviews_since_timeout > self.review_threshold):
+	    self.reviews_since_timeout -= self.review_threshold
+	    self.timeout()
+    
+        try:
+            next_page = sel.xpath('//a[@class="nav next rndBtn rndBtnGreen taLnk"]/@href').extract()[0]
+            url = self.parse_url(next_page)
+            request = Request(url, callback=self.parse_all_pages)
+            request.meta['total'] = total
+            request.meta['user_reviews'] = user_reviews 
+	    yield request
+        except IndexError:
+            self.write_to_xml()
+            return;
+        
+       
+    def timeout(self):
+	timeOutLength = self.timeOutBase + random.randint(self.timeOutVariance * -1, self.timeOutVariance)
+	print "Timing out for ", timeOutLength, " seconds"
+	time.sleep(timeOutLength)
+            
+    #adds beginning to incomplete urls             
+    def parse_url(self, url):
+        return "http://tripadvisor.com" + url
+
+    #writes the tree to the XML file
+    def write_to_xml(self):            
+        
+	#iterates through every node
+        for node in self.root.getiterator():
+	    #iterates through every attribute of a node
+	    for key, val in node.attrib.items():
+		c = ''
+		new_val = ''
+		for char in val:
+		    #decodes characters for parsing
+		    try:
+	  	        c = char.decode('utf-8')
+		    except:
+			pass
+		
+		    #removes all special characters but not spaces
+		    #removes all special characters but not spaces
+		    #removes all special characters but not spaces
+		    if char.isalnum() or char == " " or char == "." or char == ";" or char == "," or char == ":":
+			new_val += c
+		
+		#updates the attribute
+		node.set(key, new_val)
+	
+	#uses the ElementTree class to pretty print the tree to XML
+	tree = xml.ElementTree(self.root)
+	tree.write(self.writeLocation, encoding='utf-8', pretty_print=True)
+	            
+    #gets the frequency of each traveler type (families, business) near top of page
+    def first_page_traveler_type(self, info, sel):
+        
+        #hotels with very little data lack this part entirely
+        try:
+            traveler_types = sel.xpath("//div[@class='value']/text()").extract()
+            temp = traveler_types[0]
+        except IndexError:
+            return
+        
+        types = xml.SubElement(info, "Traveler_Types")
+        
+        families = xml.SubElement(types, "Families")
+        couples = xml.SubElement(types, "Couples")
+        solo = xml.SubElement(types, "Solo")
+        business = xml.SubElement(types, "Business")
+        
+        #parse out commas in large numbers
+        parsed_traveler_types = []
+        for i in range(0, len(traveler_types)):
+            current = traveler_types[i]
+            if "," in current:
+                firsthalf = current[:current.find(",")]
+                secondhalf = current[current.find(",")+1:]
+                parsed_traveler_types.append(firsthalf + secondhalf)
+            else:
+                parsed_traveler_types.append(current)
+        
+        families.set("total", parsed_traveler_types[0])
+        couples.set("total", parsed_traveler_types[1])
+        solo.set("total", parsed_traveler_types[2])
+        business.set("total", parsed_traveler_types[3])
+        
+    #overall frequency of each rating quality (excellent, poor) found near top of webpage
+    def first_page_ratings(self, info, sel):
+        
+        #hotels with very little data lack this part entirely
+        try:
+            nonzero_ratings = sel.xpath("//span[@class='compositeCount']/text()").extract()
+            temp = nonzero_ratings[0]
+        except IndexError:
+            return
+        
+        overall = xml.SubElement(info, "Overall_Ratings")
+        
+        #ratings with a frequency of zero are treated separately
+        possibilities = ["Excellent", "Very_Good", "Average", "Poor", "Terrible"]
+        ratings_html = sel.xpath("//div[@class='wrap row']").extract()
+        row_disabled_index = 0
+        for i in range(0, len(ratings_html)):
+            if "compositeCount disabled" in ratings_html[i]:
+                name = sel.xpath("//label[@class='row disabled']/span/text()").extract()[row_disabled_index]
+                if "good" in name:
+                    node = xml.SubElement(overall, "Very_Good")
+                    possibilities.remove("Very_Good")
+                else:
+                    node = xml.SubElement(overall, name)
+                    possibilities.remove(name)
+                row_disabled_index += 1
+                node.set("total", "0")
+                
+                
+                  
+        
+        #parse out commas in large numbers
+        parsed_ratings = []
+        for i in range(0, len(nonzero_ratings)):
+            current = nonzero_ratings[i]
+            if "," in current:
+                firsthalf = current[:current.find(",")]
+                secondhalf = current[current.find(",")+1:]
+                parsed_ratings.append(firsthalf + secondhalf)
+            else:
+                parsed_ratings.append(current)
+                
+        for i in range(0, len(possibilities)):
+            node = xml.SubElement(overall, possibilities[i])
+            node.set("total", nonzero_ratings[i])
+
+        
+        
+    
+    #averages of the ratings of specific hotel aspects(sleep quality, location)
+    def first_page_rating_summary(self, info, sel):
+        
+        #hotels with very little data lack this part entirely
+        try:
+            rating_types = sel.xpath("//span[@class='rate sprite-rating_s rating_s']/img[@alt]").extract()
+            temp = rating_types[0]
+        except IndexError:
+            return
+        
+        types = ["Sleep_Quality", "Location", "Rooms", "Service", "Value", "Cleanliness"]
+        rating_summary = xml.SubElement(info, "Rating_Summary")
+        
+        #assigns value based on 5 star rating
+        for i in range(0, len(types)):
+            current_criteria = xml.SubElement(rating_summary, types[i])
+            if "4.5 of 5" in rating_types[i]:
+                current_criteria.set("star_rating", "4.5")
+            elif "3.5 of 5" in rating_types[i]:
+                current_criteria.set("star_rating", "3.5")
+            elif "2.5 of 5" in rating_types[i]:
+                current_criteria.set("star_rating", "2.5")
+            elif "1.5 of 5" in rating_types[i]:
+                current_criteria.set("star_rating", "1.5")
+            elif ".5 of 5" in rating_types[i]:
+                current_criteria.set("star_rating", ".5")
+            elif "0 of 5" in rating_types[i]:
+                current_criteria.set("star_rating", "0")
+            elif "1 of 5" in rating_types[i]:
+                current_criteria.set("star_rating", "1")
+            elif "2 of 5" in rating_types[i]:
+                current_criteria.set("star_rating", "2")
+            elif "3 of 5" in rating_types[i]:
+                current_criteria.set("star_rating", "3")
+            elif "4 of 5" in rating_types[i]:
+                current_criteria.set("star_rating", "4")
+            else:
+                current_criteria.set("star_rating", "5")
+
+    #gets the hotel's address
+    def first_page_address(self, info, sel):
+	
+	#in case the hotel lacks an address
+	try:
+	    address = sel.xpath("//span[@class='street-address']/text()").extract()[0]
+	except IndexError:
+	    return
+
+	address_node = xml.SubElement(info, "Address")
+	address_node.set("address", address)
+                
+    #Parse/grab the review body from the full element
+    def addBody(self, review_xml, review_html):
+	review = review_html[review_html.find('"partial_entry">') + 16:]
+	review = review[:review.find('<')]
+	review = review.strip().replace('\n', ' ').replace('\r', '')
+	review_xml.set("text", review)
+	return review_xml
+
+    #if the reviewer has a title set a user attribute
+    def addTitle(self, sel, review_html, user):
+	title = review_html[review_html.find('"noQuotes">') + 11:]
+	title = title[:title.find('<')]
+        user.set("title", title)
+    
+    #adds the reviewer's username as an attribute
+    def addUsername(self, sel, review_html, user):
+        username = review_html[review_html.find("'user_name_name_click'") + 25:]
+        username = username[:username.find('<')]
+        user.set("username", username)
+    
+    #adds the reviewer's location as an attribute    
+    def addLocation(self, sel, review_html, user):
+        location = review_html[review_html.find('class="location">') + 18:]
+        location = location[:location.find('<')]        
+        location = location[:-1]
+        if(location == ""):
+            return
+        user.set("location", location)
+    
+    #adds the number of reviews as an attribute    
+    def addReviewCount(self, sel, i, user):
+        try:
+            review_count_html = sel.xpath("//div[@class='reviewerBadge badge']").extract()[i]
+        except IndexError:
+            return
+        review_count = review_count_html[review_count_html.find('class="badgeText">') + 18:]
+	review_count = review_count[:review_count.find('<')]
+        user.set("review_count", review_count)
+
+
+    #adds the star rating of the review as a user attribute    
+    def addReviewRating(self, sel, i, user):
+        try:
+            review_rating_html = sel.xpath("//div[@class='col2of2']/div/div/div/span/img").extract()[i]
+        except IndexError:
+            return
+        
+        if "0 of 5" in review_rating_html:
+             user.set("review_star_rating", "0")
+        elif "1 of 5" in review_rating_html:
+             user.set("review_star_rating", "1")
+        elif "2 of 5" in review_rating_html:
+             user.set("review_star_rating", "2")
+        elif "3 of 5" in review_rating_html:
+             user.set("review_star_rating", "3")
+        elif "4 of 5" in review_rating_html:
+             user.set("review_star_rating", "4")
